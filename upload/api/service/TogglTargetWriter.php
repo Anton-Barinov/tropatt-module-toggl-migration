@@ -81,7 +81,7 @@ final class TogglTargetWriter
     }
 
     /** @return array{target_type:string,target_public_id:string,state:string,warnings:array<int,string>} */
-    public function tag(array $job, array $payload): array
+    public function tag(array $job, array $payload, array $actor): array
     {
         $source = (string)($payload['gid'] ?? '');
         $workspace = (string)$job['workspace_gid'];
@@ -93,9 +93,9 @@ final class TogglTargetWriter
             'title' => $this->name($payload, 'Toggl tag'),
             'color' => $this->color((string)($payload['color'] ?? '')),
             'description' => 'Imported from Toggl tag ' . $source,
-        ]);
+        ], $actor);
         if ($created === 'TAG_CODE_EXISTS') {
-            $found = $this->service('service.tag')->list(['search' => $code, 'limit' => 5]);
+            $found = $this->service('service.tag')->list(['search' => $code, 'limit' => 5], $actor);
             $created = (array)($found['items'][0] ?? []);
         }
         if (!is_array($created) || empty($created['public_id'])) throw new RuntimeException('TOGGL_TAG_CREATE_FAILED');

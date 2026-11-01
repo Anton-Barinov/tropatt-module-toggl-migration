@@ -18,19 +18,20 @@ final class TogglWorkerHandler
         $repo = new TogglMigrationRepository($container->get('db.pdo'));
         $job = $repo->claimNextJob();
         if ($job === null) return json_encode(['processed' => 0], JSON_UNESCAPED_UNICODE) ?: '{}';
-        $token = (string)($job['lease_token'] ?? '');
+        $organizationId=(int)($job['organization_id']??0);$token = (string)($job['lease_token'] ?? '');
+        if($organizationId<1||$token==='')return json_encode(['processed'=>0,'failed'=>1],JSON_UNESCAPED_UNICODE)?:'{}';
         $client = new TogglClient($repo);
         $crawler = new TogglCrawler($client, $repo);
         $writer = new TogglTargetWriter($container, $repo, $client);
         $service = new TogglImportService($repo, $client, $crawler, $writer);
         try {
-            $service->processJob((string)$job['public_id'], $token);
+            $service->processJob((string)$job['public_id'], $organizationId, $token);
             $repo->releaseLease((string)$job['public_id'], $token);
             return json_encode(['processed' => 1, 'job' => $job['public_id']], JSON_UNESCAPED_UNICODE) ?: '{}';
         } catch (\Throwable $e) {
-            $repo->addLog((int)$job['id'], 'error', 'worker', 'Toggl worker failed.');
-            if ($token === '' || $repo->ownsLease((string)$job['public_id'], $token)) {
-                try { $repo->updateJobStatus((string)$job['public_id'], 'failed', $token !== '' ? $token : null); } catch (\Throwable) { }
+            if ($token !== '' && $repo->ownsLease((string)$job['public_id'], $token)) {
+                try { $repo->addLog((int)$job['id'], 'error', 'worker', 'Toggl worker failed.'); } catch (\Throwable) { }
+                try { $repo->updateJobStatus((string)$job['public_id'], 'failed', $token, null); } catch (\Throwable) { }
                 $repo->releaseLease((string)$job['public_id'], $token);
             }
             return json_encode(['processed' => 1, 'failed' => 1], JSON_UNESCAPED_UNICODE) ?: '{}';

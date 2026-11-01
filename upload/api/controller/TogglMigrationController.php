@@ -36,6 +36,17 @@ final class TogglMigrationController
 
     private function actorId(): int { return (int)($this->actor()['id'] ?? 0); }
 
+    private function workspaceAccess(): array|JsonResponse
+    {
+        $actor=$this->actor(); if((int)($actor['id']??0)<1)return JsonResponse::error('UNAUTHORIZED','Authentication is required',401);
+        if(!$this->container->has('service.organization_context')||!$this->container->has('request'))return JsonResponse::error('WORKSPACE_REQUIRED','Select a CRM workspace before using this module',409);
+        try{$resolved=$this->container->get('service.organization_context')->resolve($this->container->get('request'),$actor);}catch(\Throwable){return JsonResponse::error('WORKSPACE_REQUIRED','Select a CRM workspace before using this module',409);}
+        if(($resolved['status']??'')==='forbidden')return JsonResponse::error('ORGANIZATION_CONTEXT_NOT_FOUND','The selected workspace is unavailable',404);
+        $organization=is_array($resolved['organization']??null)?$resolved['organization']:[];$organizationId=(int)($organization['id']??0);
+        if(($resolved['status']??'')!=='active'||$organizationId<1||(!empty($actor['is_root'])&&empty($resolved['is_explicit'])))return JsonResponse::error('WORKSPACE_REQUIRED','Select a workspace before using this module',409);
+        $actor['organization_id']=$organizationId;$actor['organization_public_id']=(string)($organization['public_id']??'');$this->repo->setOrganizationId($organizationId);return ['actor'=>$actor,'organization_id'=>$organizationId];
+    }
+
     private function can(string $permission): bool
     {
         $actor = $this->actor();
@@ -44,6 +55,7 @@ final class TogglMigrationController
 
     private function connection(string $id): array|JsonResponse
     {
+        $workspace=$this->workspaceAccess(); if($workspace instanceof JsonResponse)return $workspace;
         $connection = $this->repo->getConnection($id);
         if (!$connection) return JsonResponse::error('NOT_FOUND', 'Toggl connection not found', 404);
         if (!$this->can('module.toggl-migration.manage') && (int)$connection['created_by_user_id'] !== $this->actorId()) return JsonResponse::error('FORBIDDEN', 'Connection access denied', 403);
@@ -52,6 +64,7 @@ final class TogglMigrationController
 
     private function job(string $id): array|JsonResponse
     {
+        $workspace=$this->workspaceAccess(); if($workspace instanceof JsonResponse)return $workspace;
         $job = $this->repo->getJob($id);
         if (!$job) return JsonResponse::error('NOT_FOUND', 'Toggl migration job not found', 404);
         if (!$this->can('module.toggl-migration.manage') && (int)$job['created_by_user_id'] !== $this->actorId()) return JsonResponse::error('FORBIDDEN', 'Migration job access denied', 403);
@@ -60,12 +73,14 @@ final class TogglMigrationController
 
     public function listConnections(): JsonResponse
     {
+        $workspace=$this->workspaceAccess(); if($workspace instanceof JsonResponse)return $workspace;
         $items = $this->repo->listConnections($this->actorId(), $this->can('module.toggl-migration.manage'));
         return JsonResponse::success('TOGGL_CONNECTIONS_LIST', 'OK', ['connections' => array_map([$this, 'publicConnection'], $items)]);
     }
 
     public function createConnection(): JsonResponse
     {
+        $workspace=$this->workspaceAccess(); if($workspace instanceof JsonResponse)return $workspace;
         return $this->withIdempotency(fn(): JsonResponse => $this->createConnectionInternal());
     }
 
@@ -176,10 +191,11 @@ final class TogglMigrationController
         return JsonResponse::success('TOGGL_USER_MAPPING_UPDATED', 'Mapping updated');
     }
 
-    public function listJobs(): JsonResponse { return JsonResponse::success('TOGGL_JOBS_LIST', 'OK', ['items' => $this->repo->listJobs($this->actorId(), $this->can('module.toggl-migration.manage'))]); }
+    public function listJobs(): JsonResponse { $workspace=$this->workspaceAccess(); if($workspace instanceof JsonResponse)return $workspace; return JsonResponse::success('TOGGL_JOBS_LIST', 'OK', ['items' => $this->repo->listJobs($this->actorId(), $this->can('module.toggl-migration.manage'))]); }
 
     public function createJob(): JsonResponse
     {
+        $workspace=$this->workspaceAccess(); if($workspace instanceof JsonResponse)return $workspace;
         return $this->withIdempotency(fn(): JsonResponse => $this->createJobInternal());
     }
 
@@ -252,7 +268,7 @@ final class TogglMigrationController
         $requestedStatus = $status;
         if ($current === 'queued' && $status === 'pausing') $requestedStatus = 'paused';
         if (in_array($current, ['draft', 'queued', 'paused', 'pausing'], true) && $status === 'cancelling') $requestedStatus = 'cancelled';
-        if (!$this->repo->requestStatus($id, $requestedStatus)) return JsonResponse::error('INVALID_JOB_STATUS', 'Job changed concurrently; retry the action', 409);
+        if (!$this->repo->requestStatus($id, $current, $requestedStatus)) return JsonResponse::error('INVALID_JOB_STATUS', 'Job changed concurrently; retry the action', 409);
         return JsonResponse::success($code, 'Job state updated');
     }
 

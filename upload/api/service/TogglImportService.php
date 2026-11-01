@@ -16,12 +16,17 @@ final class TogglImportService
     ) {
     }
 
-    public function processJob(string $jobPublicId, ?string $leaseToken = null): void
+    public function processJob(string $jobPublicId, int $organizationId, string $leaseToken): void
     {
+        if($organizationId<1||$leaseToken==='')throw new RuntimeException('TOGGL_WORKSPACE_REQUIRED');
+        $this->repo->setOrganizationId($organizationId);
         $job = $this->repo->getJob($jobPublicId);
-        if (!$job) return;
+        if(!$job||(int)($job['organization_id']??0)!==$organizationId||!$this->repo->ownsLease($jobPublicId,$leaseToken))throw new RuntimeException('TOGGL_JOB_LEASE_LOST');
+        $owner=$this->repo->actor((int)($job['created_by_user_id']??0),$organizationId);
+        if($owner===null)throw new RuntimeException('TOGGL_JOB_OWNER_MEMBERSHIP_REVOKED');
+        $this->assertWorkerContext($jobPublicId,$organizationId,$leaseToken,$job);
+        if(in_array((string)($job['status']??''),['pausing','cancelling'],true)){$next=$job['status']==='pausing'?'paused':'cancelled';$this->repo->updateJobStatus($jobPublicId,$next,$leaseToken,(string)$job['status']);return;}
         if (($job['mode'] ?? 'import') !== 'dry_run') {
-            $owner = $this->repo->actor((int)($job['created_by_user_id'] ?? 0));
             if (empty($owner['is_root'])) throw new RuntimeException('TOGGL_ROOT_REQUIRED');
         }
         $connection = $this->repo->getConnectionById((int)$job['connection_id']);
@@ -29,7 +34,7 @@ final class TogglImportService
         $token = EncryptionService::decrypt((string)($connection['access_token_encrypted'] ?? ''));
         if ($token === null) throw new RuntimeException('TOGGL_CREDENTIAL_DECRYPT_FAILED');
         $this->client->setConnectionId((int)$connection['id']);
-        $heartbeat = $leaseToken !== null ? fn(): bool => $this->repo->heartbeat($jobPublicId, $leaseToken) : null;
+        $heartbeat = fn(): bool => $this->workerHeartbeat($jobPublicId,$organizationId,$leaseToken,$job);
         $cursorRaw = json_decode((string)($job['last_source_cursor'] ?? ''), true);
         $resume = is_array($cursorRaw) && ($cursorRaw['phase'] ?? '') === 'import' && $this->repo->itemCount((int)$job['id']) > 0 && str_starts_with((string)($job['current_step'] ?? ''), 'import_');
         if ($resume) {
@@ -37,7 +42,7 @@ final class TogglImportService
         } else {
             $this->repo->updateProgress($jobPublicId, 'crawl', 0, ['message' => 'Загрузка данных Toggl'], $leaseToken);
             $crawl = $this->crawler->crawl($job, $token, $heartbeat);
-            if ($leaseToken !== null && !$this->repo->heartbeat($jobPublicId, $leaseToken)) throw new RuntimeException('TOGGL_JOB_LEASE_LOST');
+            if (!$this->workerHeartbeat($jobPublicId,$organizationId,$leaseToken,$job)) throw new RuntimeException('TOGGL_JOB_LEASE_LOST');
             $this->repo->addLog((int)$job['id'], 'info', 'crawl', 'Toggl source graph loaded.', $crawl);
             if (($job['mode'] ?? 'import') !== 'dry_run') $this->repo->updateCursor($jobPublicId, json_encode(['phase'=>'import','priority'=>0,'id'=>0], JSON_UNESCAPED_UNICODE), $leaseToken);
         }
@@ -49,7 +54,7 @@ final class TogglImportService
             return;
         }
 
-        $actor = $this->repo->actor((int)$job['created_by_user_id']);
+        $actor=$this->repo->actor((int)$job['created_by_user_id'],$organizationId); if($actor===null)throw new RuntimeException('TOGGL_JOB_OWNER_MEMBERSHIP_REVOKED');
         $total = max(1, $this->repo->itemCount((int)$job['id']));
         $counts = $this->repo->itemCounts((int)$job['id']);
         $done = array_sum(array_map('intval', array_intersect_key($counts, array_flip(['imported','updated','skipped','failed']))));
@@ -60,7 +65,7 @@ final class TogglImportService
 
         while (($items = $this->repo->importItemsBatch((int)$job['id'], $priority, $lastId, 250)) !== []) {
             foreach ($items as $item) {
-                if ($leaseToken !== null && !$this->repo->heartbeat($jobPublicId, $leaseToken)) throw new RuntimeException('TOGGL_JOB_LEASE_LOST');
+                if (!$this->workerHeartbeat($jobPublicId,$organizationId,$leaseToken,$job)) throw new RuntimeException('TOGGL_JOB_LEASE_LOST');
                 $current = $this->repo->getJob($jobPublicId);
                 $status = (string)($current['status'] ?? '');
                 if (in_array($status, ['pausing','paused','cancelling','cancelled'], true)) {
@@ -90,7 +95,7 @@ final class TogglImportService
                     $result = match ($type) {
                         'client' => $this->writer->client($job, $payload, $actor),
                         'project' => $this->writer->project($job, $payload, $actor),
-                        'tag' => $this->writer->tag($job, $payload),
+                        'tag' => $this->writer->tag($job, $payload, $actor),
                         'task' => $this->writer->task($job, $payload, $actor),
                         'time_entry' => $this->writer->timeEntry($job, $payload, $actor),
                         default => ['target_type'=>'','target_public_id'=>'','state'=>'skipped','warnings'=>['Unknown source item skipped.']],
@@ -132,25 +137,32 @@ final class TogglImportService
         $this->repo->updateSummary($jobPublicId, $summary, $leaseToken);
         $this->repo->updateProgress($jobPublicId, 'completed', 100, $summary, $leaseToken);
         $failed = (int)($summary['items']['failed'] ?? 0);
-        $this->repo->updateJobStatus($jobPublicId, ($failed > 0 || $summary['warnings'] !== []) ? 'completed_with_warnings' : 'completed', $leaseToken);
         $this->repo->addLog((int)$job['id'], 'info', 'completed', 'Toggl migration completed.', ['failed'=>$failed,'warnings'=>count($summary['warnings'])]);
+        $this->repo->updateJobStatus($jobPublicId, ($failed > 0 || $summary['warnings'] !== []) ? 'completed_with_warnings' : 'completed', $leaseToken);
     }
+
+    private function workerHeartbeat(string $jobPublicId,int $organizationId,string $leaseToken,array $job): bool
+    { $this->assertWorkerContext($jobPublicId,$organizationId,$leaseToken,$job);return $this->repo->heartbeat($jobPublicId,$leaseToken); }
+
+    private function assertWorkerContext(string $jobPublicId,int $organizationId,string $leaseToken,array $job): void
+    { if((int)($job['organization_id']??0)!==$organizationId||!$this->repo->ownsLease($jobPublicId,$leaseToken))throw new RuntimeException('TOGGL_JOB_LEASE_LOST');if($this->repo->actor((int)($job['created_by_user_id']??0),$organizationId)===null)throw new RuntimeException('TOGGL_JOB_OWNER_MEMBERSHIP_REVOKED'); }
 
     public function rollback(string $jobPublicId, array $actor): void
     {
         $job = $this->repo->beginRollback($jobPublicId);
         if (!$job) throw new RuntimeException('TOGGL_ROLLBACK_REQUIRES_TERMINAL_JOB');
         $lease = (string)($job['lease_token'] ?? '');
+        $organizationId=(int)($job['organization_id']??0);if($organizationId<1||$lease==='')throw new RuntimeException('TOGGL_JOB_LEASE_LOST');
         // Target services authorize against the original import owner. The
         // controller already authorizes the rollback initiator separately.
-        $actor = $this->repo->actor((int)$job['created_by_user_id']);
+        $actor=$this->repo->actor((int)$job['created_by_user_id'],$organizationId); if($actor===null)throw new RuntimeException('TOGGL_JOB_OWNER_MEMBERSHIP_REVOKED');
         $warnings = [];
         try {
             $cursor = json_decode((string)($job['last_source_cursor'] ?? ''), true);
             $before = is_array($cursor) ? max(1, (int)($cursor['before_id'] ?? PHP_INT_MAX)) : PHP_INT_MAX;
             while (($items = $this->repo->rollbackItemsBatch((int)$job['id'], $before, 250)) !== []) {
                 foreach ($items as $item) {
-                    if (!$this->repo->heartbeat($jobPublicId, $lease)) throw new RuntimeException('TOGGL_ROLLBACK_LEASE_LOST');
+                    if (!$this->repo->heartbeat($jobPublicId, $lease)||$this->repo->actor((int)$job['created_by_user_id'],$organizationId)===null) throw new RuntimeException('TOGGL_ROLLBACK_LEASE_LOST');
                     if ((int)($item['created_by_job'] ?? 0) !== 1 || empty($item['target_public_id'])) continue;
                     try {
                         $type = (string)$item['target_type'];
@@ -167,7 +179,7 @@ final class TogglImportService
                             $serviceId = match ($type) { 'client'=>'service.client', 'project'=>'service.project', 'task'=>'service.task', 'tag'=>'service.tag', default=>'' };
                             if ($serviceId === '') continue;
                             $service = $this->writer->service($serviceId);
-                            $deleted = $type === 'tag' ? $service->delete((string)$item['target_public_id']) : $service->delete((string)$item['target_public_id'], $actor);
+                            $deleted = $service->delete((string)$item['target_public_id'], $actor);
                             if ($deleted !== true) throw new RuntimeException('TOGGL_TARGET_NOT_DELETED');
                         }
                         $this->repo->upsertItem((int)$job['id'], (string)$item['source_type'], (string)$item['source_id'], ['status'=>'rolled_back']);
